@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import fetch_news
-from draft import cap_for_copy, make_styled_tweet
+from draft import cap_for_copy, copy_with_source, make_styled_tweet
 from filters import (
     FRESH_WINDOW,
     headline_hash,
@@ -168,6 +168,9 @@ class TestImages(unittest.TestCase):
     def test_rss_image_none(self):
         self.assertEqual(fetch_news.rss_image({}), "")
 
+    def test_google_placeholder_host_is_not_used_as_article_image(self):
+        self.assertIsNone(asyncio.run(fetch_news.fetch_image_bytes("https://news.google.com/images/logo.png")))
+
 
 class TestCopyButton(unittest.TestCase):
     def test_copy_text_always_within_256(self):
@@ -183,11 +186,19 @@ class TestCopyButton(unittest.TestCase):
         draft = make_styled_tweet("India win", "#TeamIndia")
         self.assertEqual(cap_for_copy(draft), draft)
 
+    def test_copy_can_include_source_when_short(self):
+        copied, has_source = copy_with_source("India win series", "https://example.com/story")
+        self.assertTrue(has_source)
+        self.assertIn("Source: https://example.com/story", copied)
+        self.assertLessEqual(len(copied), 256)
+
     def test_caption_contains_source_link(self):
         item = {"title": "India win series", "link": "https://example.com/story"}
-        caption, copy_text = fetch_news.build_post(item, "#TeamIndia")
+        caption, tweet_copy, source_copy, has_source = fetch_news.build_post(item, "#TeamIndia")
         self.assertIn("https://example.com/story", caption)
-        self.assertLessEqual(len(copy_text), 256)
+        self.assertLessEqual(len(tweet_copy), 256)
+        self.assertLessEqual(len(source_copy), 256)
+        self.assertTrue(has_source)
 
 
 if __name__ == "__main__":

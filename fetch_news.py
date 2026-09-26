@@ -20,13 +20,14 @@ import logging
 import os
 import time
 from datetime import datetime
+from urllib.parse import urlparse
 
 import feedparser
 import httpx
 from dotenv import load_dotenv
 from telegram import Bot, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
 
-from draft import cap_for_copy, make_styled_tweet, smart_tags, strip_source
+from draft import cap_for_copy, copy_with_source, make_styled_tweet, smart_tags, strip_source
 from filters import IST, entry_time, headline_hash, should_accept
 
 load_dotenv()
@@ -123,6 +124,12 @@ async def fetch_image_bytes(url: str):
     """Valid HTTP/HTTPS image download (content-type + size check). Fail → None."""
     if not url or not url.startswith(("http://", "https://")):
         return None
+    host = urlparse(url).hostname or ""
+    # Google News sometimes exposes its own logo/placeholder as media content.
+    # Never publish that generic image as if it were the article photo.
+    if (host == "news.google.com" or host.endswith(".gstatic.com")
+            or host.endswith(".googleusercontent.com")):
+        return None
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             r = await client.get(url)
@@ -154,17 +161,20 @@ def ist_str(epoch: float) -> str:
 
 
 def build_post(item: dict, tags: str):
-    """Return (caption, copy_text). Copy text hamesha 256 chars ke andar."""
+    """Return (caption, tweet_copy, source_copy)."""
     draft = make_styled_tweet(item["title"], smart_tags(item["title"], tags))
     caption = f"{draft}\n\nSource: {item['link']}" if item["link"] else draft
-    return caption, cap_for_copy(draft)
+    tweet_copy = cap_for_copy(draft)
+    source_copy, has_source = copy_with_source(draft, item.get("link", ""))
+    return caption, tweet_copy, source_copy, has_source
 
 
 async def send_one(bot, item: dict, chat_id: str, tags: str, img) -> bool:
-    caption, copy_text = build_post(item, tags)
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Copy tweet", copy_text=CopyTextButton(text=copy_text))]]
-    )
+    caption, tweet_copy, source_copy, has_source = build_post(item, tags)
+    rows = [[InlineKeyboardButton("Copy tweet", copy_text=CopyTextButton(text=tweet_copy))]]
+    if has_source and source_copy != tweet_copy:
+        rows.append([InlineKeyboardButton("Copy with source", copy_text=CopyTextButton(text=source_copy))])
+    keyboard = InlineKeyboardMarkup(rows)
     if img:
         await bot.send_photo(
             chat_id=chat_id, photo=img, caption=caption, reply_markup=keyboard

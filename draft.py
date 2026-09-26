@@ -20,6 +20,25 @@ def cap_for_copy(text: str) -> str:
     return t + "\u2026"
 
 
+def copy_with_source(draft: str, source_url: str) -> tuple[str, bool]:
+    """Return copy text and whether the full source was included."""
+    source_url = (source_url or "").strip()
+    if not source_url:
+        return cap_for_copy(draft), False
+    full = f"{draft}\n\nSource: {source_url}"
+    if len(full) <= COPY_LIMIT:
+        return full, True
+    source_line = f"Source: {source_url}"
+    if len(source_line) < COPY_LIMIT:
+        room = COPY_LIMIT - len(source_line) - 2
+        body = draft[:room].rstrip()
+        cut = body.rfind(" ")
+        if cut > room // 2:
+            body = body[:cut].rstrip()
+        return f"{body}\u2026\n\n{source_line}", True
+    return cap_for_copy(draft), False
+
+
 def clean_text(text: str) -> str:
     """Extra spaces/lines हटाकर text साफ करता है।"""
     t = (text or "").strip()
