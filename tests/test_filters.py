@@ -81,6 +81,7 @@ class TestRelevance(unittest.TestCase):
             "India probable XI for 1st ODI against West Indies",
             "Predicted XI: India likely to make two changes",
             "Rumours of BCCI mulling coaching change surface",
+            "India vs West Indies Dream11 Prediction for the 1st ODI: Captain, vice-captain",
         ]:
             ok, _ = should_accept(make_entry(title, minutes_ago=8))
             self.assertFalse(ok, title)

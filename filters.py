@@ -49,6 +49,7 @@ REJECT_PATTERNS = [
     r"\bpodcast\b", r"\bmeme\b", r"\bpolls?\b",
     r"\b(probable|predicted|expected|likely)\s+(XI|eleven|11)\b",
     r"\brumou?rs?\b", r"\bunconfirmed\b",
+    r"\bDream11\b", r"\bfantasy\b", r"\b(betting|odds)\b",
     r"\bmedals? tally\b", r"\bcommentary\b", r"\bscorecard\b",
     r"\blive (cricket )?score\b", r"\brecords? & stats\b",
     r"\bfull table\b", r"\bwinners list\b",
