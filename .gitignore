@@ -1,9 +1,9 @@
 # Secrets — kabhi GitHub par upload mat karna!
 .env
 
-# Bot ki state
-seen.json
-
 # Python
 __pycache__/
 *.pyc
+
+# NOTE: seen.json yahan se hata diya gaya hai —
+# GitHub Actions ko usse commit karna hai taki state persist ho.

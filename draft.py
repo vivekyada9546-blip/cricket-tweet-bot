@@ -77,7 +77,8 @@ def smart_tags(title: str, base_tags: str = "#TeamIndia #IndianCricket") -> str:
         match_tag = "#INDv" + m.group(1).upper()
         if match_tag.lower() not in tags.lower():
             tags += " " + match_tag
-    return tags
+    # hashtags limited rakho — max 4
+    return " ".join(tags.split()[:4])
 
 
 def tweet_style(title: str) -> str:

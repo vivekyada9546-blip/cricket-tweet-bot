@@ -1,9 +1,12 @@
 """
-Cricket news fetcher — GitHub Actions / cron के लिए one-shot script
+Cricket news fetcher v2 — GitHub Actions / cron के लिए one-shot script
 ====================================================================
-RSS feeds (default: Google News cricket) से नई news पढ़ता है और
-आपके Telegram पर tweet-ready draft (Copy button के साथ) भेजता है।
-पुरानी news repeat न हों — इसलिए seen.json में IDs याद रखता है।
+- सिर्फ Indian cricket news (Team India, IPL, domestic, Indian players)
+- सिर्फ पिछले 2 घंटे की fresh news (actual RSS timestamp से verify)
+- duplicates रोकना: GUID + link + normalized headline hash
+- जहाँ image मिले वहाँ photo के साथ post (RSS image → og:image → text fallback)
+- Copy tweet button (Telegram की 256-char limit के अंदर)
+- सिर्फ successful send के बाद item seen मार्क होता है (seen.json commit होता है)
 
 चलाने के लिए env चाहिए: BOT_TOKEN, CHAT_ID
 (optional: HASHTAGS, RSS_URLS, MAX_PER_RUN)
@@ -13,13 +16,18 @@ RSS feeds (default: Google News cricket) से नई news पढ़ता ह�
 
 import asyncio
 import json
+import logging
 import os
+import time
+from datetime import datetime
 
 import feedparser
+import httpx
 from dotenv import load_dotenv
 from telegram import Bot, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
 
-from draft import COPY_LIMIT, cap_for_copy, make_styled_tweet, smart_tags, strip_source
+from draft import cap_for_copy, make_styled_tweet, smart_tags, strip_source
+from filters import IST, entry_time, headline_hash, should_accept
 
 load_dotenv()
 
@@ -27,46 +35,205 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 TAGS = os.getenv("HASHTAGS", "#TeamIndia #IndianCricket").strip() or "#TeamIndia #IndianCricket"
 
-# Default: सिर्फ Indian cricket — Team India, IPL, Indian domestic
+# Sources: ESPNcricinfo (primary) + Google News India queries.
+# Har source par wahi freshness + relevance filter lagta hai.
 DEFAULT_FEEDS = ",".join([
-    "https://news.google.com/rss/search?q=india+cricket+team+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
-    "https://news.google.com/rss/search?q=india+playing+xi+OR+probable+xi+OR+india+squad+when:3d&hl=en-IN&gl=IN&ceid=IN:en",
-    "https://news.google.com/rss/search?q=IPL+when:2d&hl=en-IN&gl=IN&ceid=IN:en",
-    "https://news.google.com/rss/search?q=ranji+trophy+OR+duleep+trophy+OR+irani+trophy+OR+indian+domestic+cricket+when:3d&hl=en-IN&gl=IN&ceid=IN:en",
+    "https://www.espncricinfo.com/rss/content/story/feeds/0.xml",
+    "https://news.google.com/rss/search?q=india+cricket+team+when:1h&hl=en-IN&gl=IN&ceid=IN:en",
+    "https://news.google.com/rss/search?q=india+playing+xi+OR+india+squad+when:2h&hl=en-IN&gl=IN&ceid=IN:en",
+    "https://news.google.com/rss/search?q=IPL+when:1h&hl=en-IN&gl=IN&ceid=IN:en",
+    "https://news.google.com/rss/search?q=ranji+trophy+OR+duleep+trophy+OR+irani+trophy+when:1h&hl=en-IN&gl=IN&ceid=IN:en",
 ])
 FEEDS = [u.strip() for u in os.getenv("RSS_URLS", DEFAULT_FEEDS).split(",") if u.strip()]
 
 STATE_FILE = os.getenv("STATE_FILE", "seen.json")
 MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "5"))
-KEEP = 800  # seen.json में इतनी IDs रखो
+KEEP = 800        # har list me itni IDs yaad rakho
+MAX_IMAGE = 5_000_000  # 5 MB — Telegram photo limit
+
+OG_RE = r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']'
+TW_RE = r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']'
+
+log = logging.getLogger("fetch_news")
 
 
-def load_seen() -> list:
+# ---------- seen.json state ----------
+
+def load_seen() -> dict:
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except (OSError, ValueError):
-        return []
+        data = None
+    if isinstance(data, dict) and all(k in data for k in ("guids", "links", "heads")):
+        return data
+    return {"guids": [], "links": [], "heads": []}
 
 
-def save_seen(seen: list) -> None:
+def save_seen(seen: dict) -> None:
+    for key in ("guids", "links", "heads"):
+        del seen[key][:-KEEP]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(seen[-KEEP:], f)
+        json.dump(seen, f)
 
 
-def collect_new_items(seen: list) -> list:
-    """सभी feeds पढ़कर नए items की list [(guid, title, link), ...] देता है।"""
-    items = []
+def already_seen(seen: dict, guid: str, link: str, head_hash: str) -> bool:
+    return (
+        (guid and guid in seen["guids"])
+        or (link and link in seen["links"])
+        or (head_hash and head_hash in seen["heads"])
+    )
+
+
+def register(seen: dict, guid: str, link: str, head_hash: str) -> None:
+    for key, val in (("guids", guid), ("links", link), ("heads", head_hash)):
+        if val and val not in seen[key]:
+            seen[key].append(val)
+
+
+# ---------- image handling ----------
+
+def rss_image(entry: dict) -> str:
+    """RSS item se image URL (media_content → media_thumbnail → enclosure)."""
+    for media in entry.get("media_content", []) or []:
+        if media.get("url"):
+            return media["url"]
+    for thumb in entry.get("media_thumbnail", []) or []:
+        if thumb.get("url"):
+            return thumb["url"]
+    for enc in entry.get("enclosures", []) or []:
+        if str(enc.get("type", "")).startswith("image/") and enc.get("href"):
+            return enc["href"]
+    return ""
+
+
+async def article_image(link: str) -> str:
+    """Article page ka Open Graph / Twitter card image URL."""
+    import re as _re
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            r = await client.get(link)
+        m = _re.search(OG_RE, r.text, _re.I) or _re.search(TW_RE, r.text, _re.I)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+async def fetch_image_bytes(url: str):
+    """Valid HTTP/HTTPS image download (content-type + size check). Fail → None."""
+    if not url or not url.startswith(("http://", "https://")):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            r = await client.get(url)
+        ctype = r.headers.get("content-type", "")
+        if r.status_code == 200 and ctype.startswith("image/") and len(r.content) <= MAX_IMAGE:
+            return r.content
+    except Exception:
+        pass
+    return None
+
+
+async def default_image_resolver(item: dict):
+    """Priority: RSS image → og:image / twitter image → None (text fallback)."""
+    img = await fetch_image_bytes(item.get("image_url", ""))
+    if img is not None:
+        return img
+    og = await article_image(item.get("link", ""))
+    if og:
+        img = await fetch_image_bytes(og)
+        if img is not None:
+            return img
+    return None
+
+
+# ---------- send ----------
+
+def ist_str(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, IST).isoformat(timespec="seconds")
+
+
+def build_post(item: dict, tags: str):
+    """Return (caption, copy_text). Copy text hamesha 256 chars ke andar."""
+    draft = make_styled_tweet(item["title"], smart_tags(item["title"], tags))
+    caption = f"{draft}\n\nSource: {item['link']}" if item["link"] else draft
+    return caption, cap_for_copy(draft)
+
+
+async def send_one(bot, item: dict, chat_id: str, tags: str, img) -> bool:
+    caption, copy_text = build_post(item, tags)
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Copy tweet", copy_text=CopyTextButton(text=copy_text))]]
+    )
+    if img:
+        await bot.send_photo(
+            chat_id=chat_id, photo=img, caption=caption, reply_markup=keyboard
+        )
+    else:
+        await bot.send_message(
+            chat_id=chat_id, text=caption, reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    return True
+
+
+async def deliver(bot, items, chat_id, tags, max_posts, image_resolver=None):
+    """Fresh items me se max_posts tak bhejo. Return: successfully sent items."""
+    if image_resolver is None:
+        image_resolver = default_image_resolver
+    sent = []
+    for item in items[:max_posts]:
+        try:
+            img = await image_resolver(item)
+            await send_one(bot, item, chat_id, tags, img)
+        except Exception as exc:
+            log.error("Send failed for %r: %s", item.get("title", "")[:60], exc)
+            continue
+        now = time.time()
+        print("Sent:", item["title"][:70])
+        print(f"Source time: {ist_str(item['epoch'])}")
+        print(f"Send time: {ist_str(now)}")
+        print(f"Delay: {int((now - item['epoch']) / 60)} minutes")
+        print("Image: sent" if img else "Image: unavailable, text fallback used")
+        sent.append(item)
+    return sent
+
+
+# ---------- main ----------
+
+def collect_candidates(seen: dict):
+    """सभी feeds पढ़ो, filters लगाओ, dedupe करो, newest-first sort करो।"""
+    candidates = []
+    seen_hashes_in_run = set()
     for url in FEEDS:
-        feed = feedparser.parse(url)
+        try:
+            feed = feedparser.parse(url)
+        except Exception as exc:
+            log.error("Feed fail %s: %s", url, exc)
+            continue
         for entry in feed.entries:
-            guid = entry.get("id") or entry.get("link") or entry.get("title")
-            if not guid or guid in seen:
+            ok, reason = should_accept(entry)
+            if not ok:
                 continue
-            items.append(
-                (guid, strip_source(entry.get("title", "")), entry.get("link", ""))
-            )
-    return items
+            title = strip_source(entry.get("title", ""))
+            head_hash = headline_hash(title)
+            guid = entry.get("id") or entry.get("link") or title
+            link = entry.get("link", "")
+            if head_hash in seen_hashes_in_run:
+                continue
+            if already_seen(seen, guid, link, head_hash):
+                continue
+            seen_hashes_in_run.add(head_hash)
+            candidates.append({
+                "guid": guid,
+                "title": title,
+                "link": link,
+                "hash": head_hash,
+                "epoch": entry_time(entry),
+                "image_url": rss_image(entry),
+            })
+    candidates.sort(key=lambda x: x["epoch"], reverse=True)
+    return candidates
 
 
 async def main() -> None:
@@ -74,46 +241,27 @@ async def main() -> None:
         raise SystemExit("BOT_TOKEN / CHAT_ID missing — repo Secrets (या .env) में भरो।")
 
     seen = load_seen()
-    fresh = collect_new_items(seen)
-    if not fresh:
-        print("कोई नई news नहीं मिली।")
+    candidates = collect_candidates(seen)
+
+    if not candidates:
+        print("No fresh, relevant Indian cricket news found.")
         return
+
+    print(f"{len(candidates)} fresh relevant items, sending max {MAX_PER_RUN}.")
 
     bot = Bot(BOT_TOKEN)
     await bot.initialize()
     try:
-        for guid, title, link in fresh[:MAX_PER_RUN]:
-            # breaking-news style tweet (headline + smart hashtags)
-            tags = smart_tags(title, TAGS)
-            draft = make_styled_tweet(title, tags)
-            # link वाला वर्ज़न — अलग button से copy हो सकता है
-            draft_with_link = make_styled_tweet(title, tags, link) if link else draft
-
-            message = draft if not link else f"{draft}\n\nSource: {link}"
-            # Telegram copy button ki limit 256 chars hai — lambe link wale
-            # version ka button sirf tab dikhao jab limit ke andar ho
-            rows = [[
-                InlineKeyboardButton("Copy tweet", copy_text=CopyTextButton(text=cap_for_copy(draft))),
-            ]]
-            if link and len(draft_with_link) <= COPY_LIMIT:
-                rows[0].append(
-                    InlineKeyboardButton("Copy with link", copy_text=CopyTextButton(text=draft_with_link))
-                )
-            keyboard = InlineKeyboardMarkup(rows)
-            await bot.send_message(
-                chat_id=CHAT_ID,
-                text=message,
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
-            )
-            print("भेजा:", title[:70])
-        extra = len(fresh) - MAX_PER_RUN
-        if extra > 0:
-            print(f"{extra} और news मिलीं पर skip कीं (MAX_PER_RUN={MAX_PER_RUN})।")
+        sent = await deliver(bot, candidates, CHAT_ID, TAGS, MAX_PER_RUN)
+        # sirf successfully sent items ko seen mark karo
+        for item in sent:
+            register(seen, item["guid"], item["link"], item["hash"])
+        print(f"Done: {len(sent)} sent, {len(candidates) - len(sent)} left for next run.")
     finally:
-        save_seen(seen + [g for g, _, _ in fresh])
+        save_seen(seen)
         await bot.shutdown()
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     asyncio.run(main())
