@@ -6,6 +6,18 @@ bot.py और fetch_news.py — दोनों इस्तेमाल कर�
 import re
 
 MAX_LEN = 280  # X की tweet limit
+COPY_LIMIT = 256  # Telegram के copy_text button की limit
+
+
+def cap_for_copy(text: str) -> str:
+    """Telegram copy button 256 chars से ज़्यादा accept नहीं करता — काट दो।"""
+    if len(text) <= COPY_LIMIT:
+        return text
+    t = text[:COPY_LIMIT].rstrip()
+    cut = t.rfind(" ")
+    if cut > COPY_LIMIT // 2:
+        t = t[:cut].rstrip()
+    return t + "\u2026"
 
 
 def clean_text(text: str) -> str:
@@ -44,7 +56,7 @@ def make_draft(text: str, tags: str = "#Cricket") -> str:
     return body + "\u2026" + tail
 
 
-# ---------- X-style breaking news tweet (siren वाला format) ----------
+# ---------- X-style breaking news tweet (styled format) ----------
 
 def smart_tags(title: str, base_tags: str = "#TeamIndia #IndianCricket") -> str:
     """Headline देखकर relevant hashtags जोड़ता है (IPL, Ranji, IND vs XX वगैरह)।"""
@@ -84,10 +96,10 @@ def tweet_style(title: str) -> str:
 def make_styled_tweet(title: str, tags: str = "#TeamIndia #IndianCricket", link: str = "") -> str:
     """News के अनुसार styled tweet draft:
 
-    breaking -> siren-emoji {headline} siren-emoji
-    XI/squad -> bat-emoji {headline}
+    breaking -> siren {headline} siren
+    XI/squad -> bat {headline}
     normal   -> {headline}
-    और नीचे flag-emoji {hashtags}
+    और नीचे flag {hashtags}
     """
     t = clean_text(title)
     if not t:

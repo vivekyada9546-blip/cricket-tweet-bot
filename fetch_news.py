@@ -19,7 +19,7 @@ import feedparser
 from dotenv import load_dotenv
 from telegram import Bot, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
 
-from draft import make_styled_tweet, smart_tags, strip_source
+from draft import COPY_LIMIT, cap_for_copy, make_styled_tweet, smart_tags, strip_source
 
 load_dotenv()
 
@@ -90,12 +90,16 @@ async def main() -> None:
             draft_with_link = make_styled_tweet(title, tags, link) if link else draft
 
             message = draft if not link else f"{draft}\n\nSource: {link}"
-            keyboard = InlineKeyboardMarkup(
-                [[
-                    InlineKeyboardButton("Copy tweet", copy_text=CopyTextButton(text=draft)),
-                    InlineKeyboardButton("Copy with link", copy_text=CopyTextButton(text=draft_with_link)),
-                ]]
-            )
+            # Telegram copy button ki limit 256 chars hai — lambe link wale
+            # version ka button sirf tab dikhao jab limit ke andar ho
+            rows = [[
+                InlineKeyboardButton("Copy tweet", copy_text=CopyTextButton(text=cap_for_copy(draft))),
+            ]]
+            if link and len(draft_with_link) <= COPY_LIMIT:
+                rows[0].append(
+                    InlineKeyboardButton("Copy with link", copy_text=CopyTextButton(text=draft_with_link))
+                )
+            keyboard = InlineKeyboardMarkup(rows)
             await bot.send_message(
                 chat_id=CHAT_ID,
                 text=message,

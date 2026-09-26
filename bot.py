@@ -24,7 +24,7 @@ from telegram.ext import (
     filters,
 )
 
-from draft import make_styled_tweet, smart_tags
+from draft import cap_for_copy, make_styled_tweet, smart_tags
 
 load_dotenv()
 
@@ -61,7 +61,7 @@ def chat_tags(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
 
 def build_reply(draft: str):
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Copy tweet", copy_text=CopyTextButton(text=draft))],
+        [[InlineKeyboardButton("Copy tweet", copy_text=CopyTextButton(text=cap_for_copy(draft)))],
          [InlineKeyboardButton("Without hashtags", callback_data="nohash")]]
     )
     header = f"Tweet ready — {len(draft)}/280 characters:\n\n{draft}"
